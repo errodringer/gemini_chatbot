@@ -1,100 +1,131 @@
-"""
-Aplicación web basada en Flask que utiliza el modelo 'gemini-1.5-flash' de Google Gemini para generar respuestas
-a partir de entradas del usuario. La aplicación almacena el historial de conversaciones y utiliza Markdown
-para formatear las respuestas generadas.
-
-Requisitos:
-- Flask y Flask-Session instalados.
-- Paquete `google.generativeai` instalado.
-- Configurar la variable de entorno `GEMINI_API_KEY` con la clave de acceso a la API de Gemini.
-
-Características:
-1. Muestra una página inicial donde el usuario puede interactuar con el modelo.
-2. Permite gestionar un historial limitado de interacciones entre usuario y modelo.
-3. Formatea las respuestas en Markdown antes de mostrarlas.
-"""
-
 import os
-
 import google.generativeai as genai
-import markdown
-import requests
-from flask import Flask, request, render_template, session
-
+from flask import Flask, render_template, request, session, jsonify, send_from_directory
 from flask_session import Session
+from werkzeug.utils import secure_filename
+from PIL import Image
+import pytesseract
+import speech_recognition as sr
+from pydub import AudioSegment
+import markdown
+from datetime import datetime
 
-# Configuración de la aplicación Flask
+# Flask app configuration
 app = Flask(__name__)
-
-# Configuración de sesiones
-app.secret_key = "clave_secreta_para_sesiones"  # Cambia esto en producción
+app.secret_key = "secret_key_for_sessions"  # Change this in production
 app.config["SESSION_TYPE"] = "filesystem"
+app.config["UPLOAD_FOLDER"] = "uploads"
+app.config["ALLOWED_EXTENSIONS"] = {"png", "jpg", "jpeg", "mp3", "wav", "txt"}
 Session(app)
 
-# Configuración del modelo Gemini
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+# Ensure the upload folder exists
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+# Configure the Gemini model
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("gemini-1.5-flash")
 
-# Constante para limitar el historial de interacciones
+# Constant to limit the interaction history
 MAX_HISTORY = 4
 
+# Set the Tesseract path explicitly if needed
+pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+
+def allowed_file(filename):
+    """Check if a file is allowed based on its extension."""
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in app.config["ALLOWED_EXTENSIONS"]
+
+def process_file(file_path, file_type):
+    """Extract content or metadata from the uploaded file."""
+    if file_type in {"png", "jpg", "jpeg"}:
+        text = pytesseract.image_to_string(Image.open(file_path))
+        return text or "No text found in the image."
+    elif file_type in {"mp3", "wav"}:
+        if not file_path.endswith(".wav"):
+            audio = AudioSegment.from_file(file_path)
+            file_path = os.path.splitext(file_path)[0] + ".wav"
+            audio.export(file_path, format="wav")
+        recognizer = sr.Recognizer()
+        try:
+            with sr.AudioFile(file_path) as source:
+                audio = recognizer.record(source)
+                text = recognizer.recognize_google(audio)
+                return text
+        except sr.UnknownValueError:
+            return "Audio was not clear enough to extract text."
+        except sr.RequestError:
+            return "Error in the speech recognition service."
+    elif file_type == "txt":
+        with open(file_path, "r") as file:
+            return file.read()
+    return "Unsupported file type."
 
 @app.route("/")
-def home():
-    """
-    Ruta principal de la aplicación. Muestra la interfaz inicial y el historial de interacciones previas,
-    si existe alguno.
-    """
+def index():
     if "history" not in session:
-        session["history"] = []  # Inicializar el historial si no está presente
+        session["history"] = []
     return render_template("index.html", history=session["history"])
-
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """
-    Procesa la entrada del usuario, genera una respuesta utilizando el modelo Gemini,
-    y actualiza el historial con la interacción actual.
-
-    Returns:
-        str: Renderiza la página principal con la nueva respuesta y el historial actualizado.
-    """
-    # Obtener el texto ingresado por el usuario
-    prompt = request.form.get("prompt")
-
-    if not prompt:
-        # Manejar el caso de entrada vacía
-        return render_template("index.html", error="Por favor, ingresa un texto válido.")
-
-    # Construir el contexto con el historial de interacciones
     history = session.get("history", [])
-    context = ""
-    for item in history[-MAX_HISTORY:]:
-        context += f"Usuario: {item['prompt']}\nModelo: {item['response_raw']}\n"
-    context += f"Usuario: {prompt}\n"
+    uploaded_file = request.files.get("file")
+    file_content = ""
+    file_name = ""
+
+    if uploaded_file and allowed_file(uploaded_file.filename):
+        file_name = secure_filename(uploaded_file.filename)
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], file_name)
+        uploaded_file.save(file_path)
+        file_type = file_name.rsplit(".", 1)[1].lower()
+        file_content = process_file(file_path, file_type)
+
+    prompt = request.form.get("prompt", "")
+    combined_input = f"<b>Uploaded file:</b> {file_name}\n{file_content}\n\n<b>User Input:</b> {prompt}".strip()
 
     try:
-        # Generar la respuesta utilizando el modelo
-        response = model.generate_content(context).text
-
-        # Formatear la respuesta en HTML utilizando Markdown
+        response = model.generate_content(combined_input).text
         output_html = markdown.markdown(response)
-
-        # Actualizar el historial con la interacción actual
+        now=datetime.now()
+        formatted_datetime=now.strftime("%Y-%m-%d %H:%M:%S")
         history.append({
-            "prompt": prompt,
+            "prompt": combined_input,
             "response_raw": response,
-            "response_html": output_html
+            "response_html": output_html,
+            "created_at": formatted_datetime
         })
         session["history"] = history
+        return jsonify({"prompt": combined_input, "response_html": output_html})
+    except Exception as e:
+        return jsonify({"error": f"Error: {e}"})
 
-        # Renderizar la página con la nueva respuesta
-        return render_template("index.html", prompt=prompt, response_html=output_html, history=history)
+@app.route("/view-history/<int:index>", methods=["GET"])
+def view_history(index):
+    history = session.get("history", [])
+    if 0 <= index < len(history):
+        return jsonify(history[index])
+    return jsonify({"error": "Invalid index."}), 400
 
-    except requests.exceptions.RequestException as e:
-        # Manejar errores de conexión o solicitudes
-        return render_template("index.html", error=f"Error al conectarse a Gemini: {e}")
+@app.route("/edit-history/<int:index>", methods=["POST"])
+def edit_history(index):
+    history = session.get("history", [])
+    if 0 <= index < len(history):
+        data = request.json
+        new_prompt = data.get("prompt")
+        if new_prompt:
+            history[index]["prompt"] = new_prompt
+            session["history"] = history
+            return jsonify({"success": True})
+    return jsonify({"error": "Invalid index or missing prompt."}), 400
 
+@app.route("/delete-history/<int:index>", methods=["POST"])
+def delete_history(index):
+    history = session.get("history", [])
+    if 0 <= index < len(history):
+        history.pop(index)
+        session["history"] = history
+        return jsonify({"success": True})
+    return jsonify({"error": "Invalid index."}), 400
 
 if __name__ == "__main__":
     app.run(debug=True)
